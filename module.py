@@ -56,6 +56,7 @@ from gpt import GPT
 import numpy as np
 import os
 import torch.nn.functional as F
+from typing import Literal
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -65,6 +66,16 @@ class ModelData:
     gradients: dict = field(default_factory=lambda: dict())
     external: dict = field(default_factory=lambda: dict())
     parameters: dict = field(default_factory=lambda: dict())
+
+def _reduce(values: list, reduction: Literal[None, "mean", "max"], dim: int):
+    if reduction is None:
+        return values
+    elif reduction == "mean":
+        return [v.mean(dim=dim) for v in values]
+    elif reduction == "max":
+        return [v.max(dim=dim) for v in values]
+    else:
+        raise ValueError("Reduction operation not recognised")
 
 
 class BaseInterpretabilityModule(ABC):
@@ -77,7 +88,7 @@ class BaseInterpretabilityModule(ABC):
         for n, p in self.model.named_parameters():
             self.data.parameters[n] = p
 
-    def initialise(self, **kwargs):
+    def initialise_dataloader(self, **kwargs):
         self.dataloader = self.custom_dataloader(**kwargs)
 
     def forward(self):
@@ -102,9 +113,9 @@ class BaseInterpretabilityModule(ABC):
 
     def _get_hook(self, name):
         def hook(module, input, output):
-            output_ = output[0].detach().cpu()
             with torch.no_grad():
-                self.data.activations[name] = output_
+                if isinstance(output, torch.Tensor):
+                    self.data.activations[name] = output.detach().cpu()
 
         return hook
 
@@ -142,41 +153,43 @@ class BaseInterpretabilityModule(ABC):
         """
         raise NotImplementedError
 
-    def get_activation_values_by_tag(self, tag: str) -> list:
+    def get_activation_values_by_tag(self, tag: str, reduction: Literal[None, "mean", "max"] = "mean", dim: int = 0) -> list:
         """
-        returns a list of activations for all the modules
-        matching the given tag
+        returns a list of activations for all the modules matching the given tag
         """
         names = []
         for name, module in self.model.named_modules():
             if isinstance(module, HookPoint) and tag in module.tags:
                 names.append(name)
-        values = [self.data.activations[name].squeeze() for name in names]
-        return values
+        values = [self.data.activations[name] for name in names]
+        return _reduce(values, reduction, dim)
 
-    def get_activation_value_by_name(self, name: str) -> torch.Tensor:
+    def get_activation_value_by_name(self, name: str, reduction: Literal[None, "mean", "max"] = "mean", dim: int = 0) -> torch.Tensor:
         """
         returns the activation for a specific module name. The full name
         must be given, e.g. "layers.0.attention.mha.fused_softmax"
         """
-        return self.data.activations[name]
+        value = [self.data.activations[name]]
+        return _reduce(value, reduction, dim)[0]
 
 
-class GPTInterpretabilityModule(BaseInterpretabilityModule):
+class GPTModule(BaseInterpretabilityModule):
     def __init__(
         self,
+        batch_size: int = 1,
+        gpt_version: Literal["gpt2", "gpt2-medium", "gpt2-large", "gpt-xl"] = "gpt2"
     ):
-        model = GPT.from_pretrained("gpt2")
+        model = GPT.from_pretrained(gpt_version)
         super().__init__(model)
-        self.initialise()
+        self.initialise_dataloader(bs=batch_size)
 
-    def custom_dataloader(self, block_size: int = 100):
+    def custom_dataloader(self, bs: int, block_size: int = 100):
         data_path = os.path.abspath(os.path.join(os.path.dirname( __file__ ), 'train.bin'))
         assert os.path.exists(data_path), "run `python3 shakespeare.py to prepare train.bin"
         data = np.memmap(data_path, dtype=np.uint16, mode='r')
 
         def get_batch():
-            ix = torch.randint(len(data) - block_size, (1,))
+            ix = torch.randint(len(data) - block_size, (bs,))
             x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
             y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
             x, y = x.to(device), y.to(device)
