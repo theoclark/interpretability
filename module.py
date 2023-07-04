@@ -64,8 +64,10 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 class ModelData:
     activations: dict = field(default_factory=lambda: dict())
     gradients: dict = field(default_factory=lambda: dict())
-    external: dict = field(default_factory=lambda: dict())
     parameters: dict = field(default_factory=lambda: dict())
+    inputs = None
+    targets = None
+    outputs = None
 
 def _reduce(values: list, reduction: Literal[None, "mean", "max"], dim: int):
     if reduction is None:
@@ -78,7 +80,7 @@ def _reduce(values: list, reduction: Literal[None, "mean", "max"], dim: int):
         raise ValueError("Reduction operation not recognised")
 
 
-class BaseInterpretabilityModule(ABC):
+class BaseModule(ABC):
     def __init__(self, model: torch.nn.Module):
         assert model is not None, "no model found"
         self.model = model
@@ -91,17 +93,19 @@ class BaseInterpretabilityModule(ABC):
     def initialise_dataloader(self, **kwargs):
         self.dataloader = self.custom_dataloader(**kwargs)
 
-    def forward(self):
+    def forward(self, inputs: torch.tensor = None, targets: torch.tensor = None):
         self.model.zero_grad()
-        self.step += 1
         self.register_hooks()
-        self.data.external = self.custom_forward(self.dataloader, self.model)
+        if inputs is None:
+            self.step += 1
+            self.data.inputs, self.data.targets = next(self.dataloader)
+        else:
+            self.data.inputs, self.data.targets = inputs, targets
+        self.data.outputs = self.custom_forward(self.data.inputs)
         self.remove_hooks()
 
     def backward(self):
-        out = self.data.external["out"]
-        target = self.data.external["target"]
-        loss = self.custom_loss(out, target)
+        loss = self.custom_loss(self.data.outputs, self.data.targets)
         loss.backward()
         for n, p in self.model.named_parameters():
             self.data.gradients[n] = p.grad
@@ -125,37 +129,45 @@ class BaseInterpretabilityModule(ABC):
         self.hooks = []
 
     @abstractmethod
-    def custom_dataloader(self, data_path: str):
+    def custom_dataloader(self, **kwargs) -> tuple:
         """
         Should be overidden inside child class to match specific model.
-        Should  be used to generate data samples (and possibly target samples)
-        that are accessed in `custom_forward`. `self.step` could be used with
-        map-style datasets.
+        Returns: 
+            Generator that yields a tuple of (inputs, targets)
         """
         raise NotImplementedError
 
     @abstractmethod
-    def custom_forward(self, dataloader, model: torch.nn.Module) -> dict:
+    def custom_forward(self, inputs, **kwargs):
         """
         Should be overidden inside child class to match specific model.
-        Should return all inputs and outputs of the model in a dictionary with
-        appropriate keys {"data", "out", "target"}. The dataloader is the same
-        as the one returned in `custom_dataloader`. These values can then be
-        accessed as attributes in `InterpetabilityModule.data.external`.
+        Arguments: 
+            inputs - value(s) returned by next(custom_dataloader())[0]
+        Returns:
+            outputs - value(s) outputed by the model
         """
         raise NotImplementedError
 
     @abstractmethod
-    def custom_loss(self, out: torch.tensor, target: torch.tensor) -> torch.tensor:
+    def custom_loss(self, outputs, targets, **kwargs) -> torch.tensor:
         """
         Should be overidden inside child class to match specific model.
-        Should return a tensor representing a single loss value.
+        Arguments:
+            outputs - value(s) returned by custom_forward()
+            targets - value(s) returned by next(custom_dataloader())[1]
+        Returns:
+            loss - torch tensor representing a single loss value
         """
         raise NotImplementedError
 
     def get_activation_values_by_tag(self, tag: str, reduction: Literal[None, "mean", "max"] = "mean", dim: int = 0) -> list:
         """
-        returns a list of activations for all the modules matching the given tag
+        Arguments:
+            tag - string corresponding to the HookPoint tag inside the model
+            reduction - how to reduce the activations (usually along the batch dimension)
+            dim - dimension along which to reduce (usually the batch dimension)
+        Returns:
+            list of activations for all the modules matching the given tag
         """
         names = []
         for name, module in self.model.named_modules():
@@ -166,14 +178,18 @@ class BaseInterpretabilityModule(ABC):
 
     def get_activation_value_by_name(self, name: str, reduction: Literal[None, "mean", "max"] = "mean", dim: int = 0) -> torch.Tensor:
         """
-        returns the activation for a specific module name. The full name
-        must be given, e.g. "layers.0.attention.mha.fused_softmax"
+        Arguments:
+            name - string corresponding to the full module name (matching model.named_modules())
+            reduction - how to reduce the activations (usually along the batch dimension)
+            dim - dimension along which to reduce (usually the batch dimension)
+        Returns:
+            activation for a specific module name
         """
         value = [self.data.activations[name]]
         return _reduce(value, reduction, dim)[0]
 
 
-class GPTModule(BaseInterpretabilityModule):
+class GPTModule(BaseModule):
     def __init__(
         self,
         batch_size: int = 1,
@@ -185,7 +201,7 @@ class GPTModule(BaseInterpretabilityModule):
 
     def custom_dataloader(self, bs: int, block_size: int = 100):
         data_path = os.path.abspath(os.path.join(os.path.dirname( __file__ ), 'train.bin'))
-        assert os.path.exists(data_path), "run `python3 shakespeare.py to prepare train.bin"
+        assert os.path.exists(data_path), "run `python3 shakespeare.py` to prepare train.bin"
         data = np.memmap(data_path, dtype=np.uint16, mode='r')
 
         def get_batch():
@@ -193,7 +209,7 @@ class GPTModule(BaseInterpretabilityModule):
             x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
             y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
             x, y = x.to(device), y.to(device)
-            return x, y
+            return (x, y)
         
         def generator():
             while True:
@@ -201,12 +217,9 @@ class GPTModule(BaseInterpretabilityModule):
         
         return generator()
 
-    def custom_forward(self, dataloader, model: torch.nn.Module) -> dict:
-        data, target = next(dataloader)
-        out, _ = model(data, target)
-        d = {"data": data, "target": target, "out": out}
-        return d
+    def custom_forward(self, inputs: torch.tensor) -> dict:
+        return self.model(inputs)
 
-    def custom_loss(self, out: torch.tensor, target: torch.tensor) -> torch.tensor:
-        loss = F.cross_entropy(out.view(-1, out.size(-1)), target.view(-1), ignore_index=-1)
+    def custom_loss(self, outputs: torch.tensor, targets: torch.tensor) -> torch.tensor:
+        loss = F.cross_entropy(outputs.view(-1, outputs.size(-1)), targets.view(-1), ignore_index=-1)
         return loss
