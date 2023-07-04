@@ -26,7 +26,7 @@ def show_attention_head(attention_values, layer: int, head: int, **kwargs):
     """
     attn = attention_values[layer][head, :, :]
     tokens = [str(i) for i in range(attn.shape[-1])]
-    return cv.attention_pattern(tokens, attn, **kwargs)
+    return cv.attention.attention_pattern(tokens, attn, **kwargs)
 
 
 def show_attention_heads(attention_values, layer: int, **kwargs):
@@ -36,7 +36,7 @@ def show_attention_heads(attention_values, layer: int, **kwargs):
     particular layer index.
     """
     tokens = [str(i) for i in range(attention_values[layer].shape[-1])]
-    return cv.attention_heads(attention_values[layer], tokens, **kwargs)
+    return cv.attention.attention_heads(attention_values[layer], tokens, **kwargs)
 
 
 def histogram(data, bins=100):
