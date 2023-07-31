@@ -1,58 +1,8 @@
-"""
-Creates a nice interface for easily analysing activations within a model.
-Each new type of model will need its own child class of `BaseInterpretabilityModule`
-in order to define custom dataloading and forward passes. This is designed to be
-used inside a notebook.
-
-Activations are stored inside `BaseInterpretabilityModule.data.activations`.
-Parameters can also be accessed in this way, as can the input, output and target
-of the model.
-
-Two methods of targeting activations are supported:
-
-1) HookPoint tags. Placing hook points within the model definition enable specific
-activations to be targeted. A custom tag should be passed so that they can be easily accessed later.
-Good for targeting specific points but requires editing the model definition. Example usage shown below.
-
-2) Module names. Doesn't require editing the model definition but more limited in terms of which activations
-you can obtain. All activations, including those from hook points, can be accessed by going into:
-`interp.data.activations` or by calling `interp.get_activation_by_name("module_name")`.
-
------------------------------------------------------------------------------------------------------
-
-Example Usage:
-
-The following lines of code will generate a diagram of an attention head.
-
-Inside Model definition:
-
-from utils import HookPoint
-
-# In init method of MultiHeadAttention:
-self.attention_hook = HookPoint(tags=["attention"])
-
-# In forward method:
-x = self.attention_hook(x)    <--- add identity function where you want to capture the activation
-
-Inside Notebook:
-
-```
-interp = ModelInterpretabilityModule(model)
-interp.forward()            # completes one forward pass
-attn = interp.get_activation_values_by_tag("attention")
-show_attention_head(attn, layer=0, head=0)
-```
-
------------------------------------------------------------------------------------------------------
-
-Utility functions for generating various plots of activations can be found in utils.py
-
-"""
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import torch
-from utils import HookPoint
-from gpt import GPT
+from .utils import HookPoint
+from .gpt.gpt import GPT
 import numpy as np
 import os
 import torch.nn.functional as F
@@ -104,7 +54,9 @@ class BaseModule(ABC):
         self.data.outputs = self.custom_forward(self.data.inputs)
         self.remove_hooks()
 
-    def backward(self):
+    def backward(self, targets: torch.tensor = None):
+        self.data.targets = targets if targets is not None else self.data.targets
+        assert self.data.targets is not None, "Cannot complete backward pass, no targets provided."
         loss = self.custom_loss(self.data.outputs, self.data.targets)
         loss.backward()
         for n, p in self.model.named_parameters():
@@ -200,8 +152,8 @@ class GPTModule(BaseModule):
         self.initialise_dataloader(bs=batch_size)
 
     def custom_dataloader(self, bs: int, block_size: int = 100):
-        data_path = os.path.abspath(os.path.join(os.path.dirname( __file__ ), 'train.bin'))
-        assert os.path.exists(data_path), "run `python3 shakespeare.py` to prepare train.bin"
+        data_path = os.path.abspath(os.path.join(os.path.dirname( __file__ ), 'gpt/train.bin'))
+        assert os.path.exists(data_path), "No data found. run `python3 gpt/shakespeare.py` to prepare train.bin"
         data = np.memmap(data_path, dtype=np.uint16, mode='r')
 
         def get_batch():

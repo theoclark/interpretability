@@ -1,0 +1,9 @@
+torch
+numpy
+matplotlib
+circuitsvis
+jupyterlab
+
+# Only required for GPT Module
+transformers
+tiktoken
